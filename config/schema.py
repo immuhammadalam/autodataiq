@@ -77,6 +77,18 @@ def create_schema(engine):
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """))
+        # Optional columns for dashboard-ready ML (add if missing)
+        for col, ddl in [
+            ("reason", "ALTER TABLE ml_models ADD COLUMN IF NOT EXISTS reason TEXT;"),
+            ("prediction_horizon", "ALTER TABLE ml_models ADD COLUMN IF NOT EXISTS prediction_horizon VARCHAR(64);"),
+            ("confidence_level", "ALTER TABLE ml_models ADD COLUMN IF NOT EXISTS confidence_level VARCHAR(16);"),
+            ("explainability", "ALTER TABLE ml_models ADD COLUMN IF NOT EXISTS explainability JSONB;"),
+        ]:
+            try:
+                conn.execute(text(ddl))
+            except Exception as e:
+                if "already exists" not in str(e).lower() and "duplicate" not in str(e).lower():
+                    logger.warning("Schema migration %s: %s", col, e)
         conn.commit()
     logger.info("Application schema created.")
 

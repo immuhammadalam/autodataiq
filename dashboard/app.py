@@ -59,13 +59,25 @@ def get_analytics_results(engine, client_id: str, dataset_id: str):
 
 
 def get_ml_models(engine, client_id: str, dataset_id: str):
-    """Load ml_models rows for client/dataset (including feature_importance for explainability)."""
+    """Load ml_models rows for client/dataset (including feature_importance, explainability, reason, prediction_horizon)."""
     with engine.connect() as conn:
         rows = conn.execute(
-            text("SELECT model_id, problem_type, target_column, model_type, metrics, feature_importance, created_at FROM ml_models WHERE client_id = :cid AND dataset_id = :did AND status = 'trained' ORDER BY created_at DESC"),
+            text("""
+                SELECT model_id, problem_type, target_column, model_type, metrics, feature_importance,
+                       created_at, reason, prediction_horizon, confidence_level, explainability
+                FROM ml_models WHERE client_id = :cid AND dataset_id = :did AND status = 'trained'
+                ORDER BY created_at DESC
+            """),
             {"cid": client_id, "did": dataset_id},
         ).fetchall()
-    return [{"model_id": r[0], "problem_type": r[1], "target_column": r[2], "model_type": r[3], "metrics": r[4], "feature_importance": r[5], "created_at": str(r[6])} for r in rows]
+    return [
+        {
+            "model_id": r[0], "problem_type": r[1], "target_column": r[2], "model_type": r[3],
+            "metrics": r[4], "feature_importance": r[5], "created_at": str(r[6]),
+            "reason": r[7], "prediction_horizon": r[8], "confidence_level": r[9], "explainability": r[10],
+        }
+        for r in rows
+    ]
 
 
 # ----- ML tab: dataset-agnostic, schema-aware -----

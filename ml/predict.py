@@ -25,12 +25,12 @@ logger = logging.getLogger(__name__)
 
 
 def _get_latest_model(engine, client_id: str, dataset_id: str, target_column: Optional[str] = None) -> Optional[dict]:
-    """Return latest ml_models row. If target_column given, return that model; else latest overall."""
+    """Return latest ml_models row. If target_column given, return that model; else latest overall. Includes metrics for confidence intervals."""
     with engine.connect() as conn:
         if target_column:
             row = conn.execute(
                 text("""
-                    SELECT model_id, artifact_path, feature_importance
+                    SELECT model_id, artifact_path, feature_importance, metrics
                     FROM ml_models WHERE client_id = :cid AND dataset_id = :did AND status = 'trained' AND target_column = :target
                     ORDER BY created_at DESC LIMIT 1
                 """),
@@ -39,13 +39,20 @@ def _get_latest_model(engine, client_id: str, dataset_id: str, target_column: Op
         else:
             row = conn.execute(
                 text("""
-                    SELECT model_id, artifact_path, feature_importance
+                    SELECT model_id, artifact_path, feature_importance, metrics
                     FROM ml_models WHERE client_id = :cid AND dataset_id = :did AND status = 'trained'
                     ORDER BY created_at DESC LIMIT 1
                 """),
                 {"cid": client_id, "did": dataset_id},
             ).fetchone()
-    return {"model_id": row[0], "artifact_path": row[1], "feature_importance": row[2]} if row else None
+    if not row:
+        return None
+    return {
+        "model_id": row[0],
+        "artifact_path": row[1],
+        "feature_importance": row[2],
+        "metrics": row[3],
+    }
 
 
 def _get_trained_targets(engine, client_id: str, dataset_id: str) -> List[str]:
@@ -127,6 +134,39 @@ def _get_processed_table(engine, client_id: str, dataset_id: str) -> Optional[st
     return row[0] if row else None
 
 
+def _predict_with_interval(
+    model,
+    X: pd.DataFrame,
+    feature_names: List[str],
+    metrics: Optional[dict] = None,
+) -> tuple:
+    """
+    Returns (pred, pred_lower, pred_upper). pred_lower/pred_upper are None if interval not available.
+    Uses ensemble tree std if available; else ±1.96*RMSE from metrics.
+    """
+    X = X.reindex(columns=feature_names).fillna(0)
+    pred = model.predict(X)
+    pred_lower = pred_upper = None
+    # Ensemble: use tree predictions for interval (sklearn RandomForest / GradientBoosting)
+    if hasattr(model, "estimators_") and model.estimators_ is not None:
+        try:
+            est = model.estimators_
+            if hasattr(est, "ravel"):
+                est = est.ravel()
+            tree_preds = np.column_stack([e.predict(X) for e in est])
+            std = np.std(tree_preds, axis=1)
+            pred_lower = pred - 1.96 * np.maximum(std, 1e-10)
+            pred_upper = pred + 1.96 * np.maximum(std, 1e-10)
+        except Exception:
+            pass
+    if pred_lower is None and metrics and isinstance(metrics, dict):
+        rmse = metrics.get("rmse")
+        if rmse is not None and np.isfinite(rmse):
+            pred_lower = pred - 1.96 * rmse
+            pred_upper = pred + 1.96 * rmse
+    return pred, pred_lower, pred_upper
+
+
 def load_model(artifact_path: str) -> dict:
     """Load pickle artifact. Returns dict with model, feature_names, target_column, problem_type."""
     # Resolve path: if relative or container path, try MODEL_PATH
@@ -147,7 +187,9 @@ def predict(
     limit: Optional[int] = None,
 ) -> pd.DataFrame:
     """
-    Load latest model and processed table for client/dataset, run predictions, return DataFrame with predictions.
+    Load latest model and processed table for client/dataset, run predictions on full (or limited) data.
+    Returns DataFrame with prediction and optional pred_lower, pred_upper when interval available.
+    Does NOT predict on training rows only; predicts on all rows (or limit) for non-forecasting use.
     """
     engine = get_engine()
     meta = _get_latest_model(engine, client_id, dataset_id)
@@ -157,6 +199,13 @@ def predict(
     model = artifact["model"]
     feature_names = artifact["feature_names"]
     target_column = artifact["target_column"]
+    metrics = meta.get("metrics")
+    if isinstance(metrics, str):
+        try:
+            import json
+            metrics = json.loads(metrics)
+        except Exception:
+            metrics = {}
 
     table_name = _get_processed_table(engine, client_id, dataset_id)
     if not table_name:
@@ -170,14 +219,13 @@ def predict(
         return pd.DataFrame(columns=["prediction"])
 
     X, _, _ = prepare_xy(df, target_column, feature_columns=feature_names)
-    X = X[feature_names] if all(c in X.columns for c in feature_names) else X
-    for c in feature_names:
-        if c not in X.columns:
-            X[c] = 0
-    X = X[feature_names]
-    preds = model.predict(X)
+    preds, pred_lower, pred_upper = _predict_with_interval(model, X, feature_names, metrics)
     df = df.copy()
     df["prediction"] = preds
+    if pred_lower is not None:
+        df["pred_lower"] = pred_lower
+    if pred_upper is not None:
+        df["pred_upper"] = pred_upper
     if hasattr(model, "predict_proba"):
         df["prediction_probability"] = model.predict_proba(X)[:, 1]
     return df
@@ -363,3 +411,70 @@ def get_next_year_predictions_table(client_id: str, dataset_id: str) -> pd.DataF
     pred_cols = [c for c in out.columns if c.startswith("prediction_") and c != "prediction_date"]
     out = out[["prediction_date"] + pred_cols].copy()
     return out
+
+
+def get_forecast_horizon(
+    client_id: str,
+    dataset_id: str,
+    target_column: Optional[str] = None,
+    periods: int = 6,
+) -> pd.DataFrame:
+    """
+    Future-period predictions for a short horizon (e.g. next 3-6 periods).
+    Returns DataFrame with period/index (timestamp), prediction, optional pred_lower, pred_upper.
+    Does NOT predict on training rows only; creates future rows for the horizon.
+    """
+    import json
+    engine = get_engine()
+    meta = _get_latest_model(engine, client_id, dataset_id, target_column=target_column)
+    if not meta:
+        return pd.DataFrame()
+    artifact = load_model(meta["artifact_path"])
+    model = artifact["model"]
+    feature_names = artifact["feature_names"]
+    target_column = artifact["target_column"]
+    table_name = _get_processed_table(engine, client_id, dataset_id)
+    if not table_name:
+        return pd.DataFrame()
+    df = pd.read_sql(f'SELECT * FROM "{table_name}"', engine)
+    if df.empty:
+        return pd.DataFrame()
+    df = _add_year_from_date(df)
+    if "year" not in df.columns or "year" not in feature_names:
+        return pd.DataFrame()
+    max_year = int(pd.to_numeric(df["year"], errors="coerce").dropna().max())
+    yr = pd.to_numeric(df["year"], errors="coerce")
+    df_last = df[yr == max_year].copy()
+    if df_last.empty:
+        df_last = df.copy()
+    if "month" not in df_last.columns:
+        df_last["month"] = 1
+    metrics = meta.get("metrics")
+    if isinstance(metrics, str):
+        try:
+            metrics = json.loads(metrics)
+        except Exception:
+            metrics = {}
+    periods = min(max(1, periods), 12)
+    next_year = max_year + 1
+    rows = []
+    for i in range(periods):
+        month = (i % 12) + 1
+        prediction_date = f"{next_year}-{month:02d}-01"
+        df_period = df_last.copy()
+        df_period["year"] = next_year
+        df_period["month"] = month
+        X_next = df_period.reindex(columns=feature_names).fillna(0)
+        for c in feature_names:
+            if c not in X_next.columns:
+                X_next[c] = 0
+        X_next = X_next[feature_names]
+        pred, pred_lower, pred_upper = _predict_with_interval(model, X_next, feature_names, metrics)
+        total = float(np.sum(pred))
+        row = {"period": prediction_date, "prediction": total}
+        if pred_lower is not None:
+            row["pred_lower"] = float(np.sum(pred_lower))
+        if pred_upper is not None:
+            row["pred_upper"] = float(np.sum(pred_upper))
+        rows.append(row)
+    return pd.DataFrame(rows)
