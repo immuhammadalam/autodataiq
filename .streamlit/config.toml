@@ -1,0 +1,12 @@
+# AutoDataIQ - Streamlit config
+# Increase limits so large CSVs (e.g. e-commerce) can upload and process
+
+[server]
+maxUploadSize = 500
+maxMessageSize = 500
+enableCORS = false
+enableXsrfProtection = true
+serverAddress = "0.0.0.0"
+
+[browser]
+gatherUsageStats = false

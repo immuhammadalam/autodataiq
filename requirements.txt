@@ -1,0 +1,24 @@
+# AutoDataIQ - Generic SaaS Data Platform
+# Python 3.10+
+
+# Data
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Database
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.0
+
+# ML & Auto-ML
+scikit-learn>=1.3.0
+
+# Dashboard
+streamlit>=1.28.0
+plotly>=5.18.0
+
+# Config & utils
+python-dotenv>=1.0.0
+pyyaml>=6.0
+
+# Schema inference & validation
+python-dateutil>=2.8.0

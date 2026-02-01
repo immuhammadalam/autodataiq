@@ -1,0 +1,106 @@
+# AutoDataIQ - Docker Compose
+# Multi-tenant data platform: ingestion → ETL → analytics → ML → dashboard
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: autodataiq_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-autodataiq}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-autodataiq_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-autodataiq}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - autodataiq_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-autodataiq} -d ${POSTGRES_DB:-autodataiq}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - autodataiq_net
+
+  etl:
+    build:
+      context: .
+      dockerfile: docker/etl.Dockerfile
+    container_name: autodataiq_etl
+    env_file: .env
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${POSTGRES_USER:-autodataiq}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-autodataiq_secret}
+      DB_NAME: ${POSTGRES_DB:-autodataiq}
+      DATA_UPLOADS_PATH: /app/data/uploads
+      DATA_RAW_PATH: /app/data/raw
+      DATA_PROCESSED_PATH: /app/data/processed
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - autodataiq_net
+    profiles:
+      - full
+      - etl
+
+  ml:
+    build:
+      context: .
+      dockerfile: docker/ml.Dockerfile
+    container_name: autodataiq_ml
+    env_file: .env
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${POSTGRES_USER:-autodataiq}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-autodataiq_secret}
+      DB_NAME: ${POSTGRES_DB:-autodataiq}
+      MODEL_PATH: /app/models
+    volumes:
+      - ./models:/app/models
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - autodataiq_net
+    profiles:
+      - full
+      - ml
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: docker/dashboard.Dockerfile
+    container_name: autodataiq_dashboard
+    env_file: .env
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${POSTGRES_USER:-autodataiq}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-autodataiq_secret}
+      DB_NAME: ${POSTGRES_DB:-autodataiq}
+      MODEL_PATH: /app/models
+    ports:
+      - "${STREAMLIT_PORT:-8501}:8501"
+    volumes:
+      - ./models:/app/models
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - autodataiq_net
+    command: streamlit run dashboard/app.py --server.port=8501 --server.address=0.0.0.0
+    profiles:
+      - full
+      - dashboard
+
+volumes:
+  autodataiq_pgdata:
+
+networks:
+  autodataiq_net:
+    driver: bridge
